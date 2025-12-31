@@ -35,7 +35,7 @@ class LinearBase(nn.Module):
 
 
 class ReplicatedLinear(LinearBase):
-
+    # 基于base实现的最简单的linear,没有tp
     def __init__(
         self,
         input_size: int,
@@ -52,7 +52,7 @@ class ReplicatedLinear(LinearBase):
 
 
 class ColumnParallelLinear(LinearBase):
-
+    # 实现了TP并行的linear, 在Column维度上
     def __init__(
         self,
         input_size: int,
@@ -74,12 +74,13 @@ class ColumnParallelLinear(LinearBase):
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
-
+    # 可以将多路径的gate, down, up等一起计算
     def __init__(
         self,
         input_size: int,
-        output_sizes: list[int],
+        output_sizes: list[int],    
         bias: bool = False,
+        tp_size: int = 1
     ):
         self.output_sizes = output_sizes
         super().__init__(input_size, sum(output_sizes), bias)
@@ -129,7 +130,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 
 class RowParallelLinear(LinearBase):
-
+    # 从Row维度上实现TP并行的linear
     def __init__(
         self,
         input_size: int,
@@ -148,6 +149,7 @@ class RowParallelLinear(LinearBase):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        # row 维度上需要all reduce
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y

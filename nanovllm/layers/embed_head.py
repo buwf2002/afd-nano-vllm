@@ -7,12 +7,13 @@ from nanovllm.utils.context import get_context
 
 
 class VocabParallelEmbedding(nn.Module):
-
+    # 将 token ID 转换为对应的嵌入向量
     def __init__(
         self,
-        num_embeddings: int,
-        embedding_dim: int,
+        num_embeddings: int, # 151936
+        embedding_dim: int, # 1024
     ):
+        
         super().__init__()
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
@@ -34,16 +35,17 @@ class VocabParallelEmbedding(nn.Module):
     def forward(self, x: torch.Tensor):
         if self.tp_size > 1:
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
+            # - self.vocab_start_idx 确保索引范围就是TP之后本地的权重
             x = mask * (x - self.vocab_start_idx)
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
-            y = mask.unsqueeze(1) * y
-            dist.all_reduce(y)
+            y = mask.unsqueeze(1) * y # 将无效的计算给mask掉
+            dist.all_reduce(y) # 所有rank的tensor对应位置相加
         return y
 
 
 class ParallelLMHead(VocabParallelEmbedding):
-
+    # 将隐藏状态转换为词汇表上的 logits
     def __init__(
         self,
         num_embeddings: int,

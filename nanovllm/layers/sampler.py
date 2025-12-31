@@ -3,7 +3,7 @@ from torch import nn
 
 
 class Sampler(nn.Module):
-
+    # 基于温度采样从logits中采样token
     def __init__(self):
         super().__init__()
 

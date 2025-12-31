@@ -60,6 +60,7 @@ class Sequence:
 
     @property
     def last_block_num_tokens(self):
+        # 最后一个block里面实际有多少的token数量
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
     def block(self, i):

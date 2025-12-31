@@ -88,7 +88,6 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3MLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -165,7 +164,7 @@ class Qwen3Model(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size) # 151936, 1024
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

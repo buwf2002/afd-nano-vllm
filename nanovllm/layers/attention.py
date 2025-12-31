@@ -40,7 +40,7 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
-class Attention(nn.Module):
+class Attention(nn.Module): 
 
     def __init__(
         self,
@@ -59,9 +59,12 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        # 写入kvcache
         if k_cache.numel() and v_cache.numel():
+            # 会根据slot_mapping把k,v写入对应位置
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
+            # 直接读出来的kvcache怎么是对应的位置吗?block table有就是当前的cache吗?
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,

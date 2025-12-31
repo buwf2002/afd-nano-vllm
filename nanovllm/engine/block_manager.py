@@ -4,7 +4,7 @@ import numpy as np
 
 from nanovllm.engine.sequence import Sequence
 
-
+# 管理block
 class Block:
 
     def __init__(self, block_id):
@@ -26,14 +26,14 @@ class Block:
 class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int):
-        self.block_size = block_size
-        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.used_block_ids: set[int] = set()
+        self.block_size = block_size # 每个 block 包含的 token 数量
+        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]  # 真实 KV blocks 存储
+        self.hash_to_block_id: dict[int, int] = dict() # hash 到 block id 的映射 
+        self.free_block_ids: deque[int] = deque(range(num_blocks)) # 可用 block id 队列
+        self.used_block_ids: set[int] = set() # 已使用 block id 集合
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    def compute_hash(cls, token_ids: list[int], prefix: int = -1): 
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))
@@ -42,31 +42,34 @@ class BlockManager:
 
     def _allocate_block(self, block_id: int) -> Block:
         block = self.blocks[block_id]
-        assert block.ref_count == 0
-        block.reset()
+        assert block.ref_count == 0 # 确保这个block是没有在用的
+        block.reset() # 初始化block
+        # 更新block的状态
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
 
     def _deallocate_block(self, block_id: int) -> Block:
-        assert self.blocks[block_id].ref_count == 0
+        assert self.blocks[block_id].ref_count == 0 # 确保这个block没有人在用
+        # 更新block的状态
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        return len(self.free_block_ids) >= seq.num_blocks # 判断是否有足够的空闲block分配给序列
 
     def allocate(self, seq: Sequence):
-        assert not seq.block_table
+        # 为一个序列分配block
+        assert not seq.block_table # 确保序列还没有分配过block
         h = -1
         cache_miss = False
         for i in range(seq.num_blocks):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
-            block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            token_ids = seq.block(i) # 按block size取tokens ids
+            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1 # 计算其hash值
+            block_id = self.hash_to_block_id.get(h, -1) # 判断当前hash对应的块是否已经存在
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids: # 不能复用block
                 cache_miss = True
-            if cache_miss:
+            if cache_miss: # 不能复用block，需要新分配block
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
             else:
@@ -82,7 +85,7 @@ class BlockManager:
             seq.block_table.append(block_id)
 
     def deallocate(self, seq: Sequence):
-        for block_id in reversed(seq.block_table):
+        for block_id in reversed(seq.block_table): # 链式hash，依赖前一个，必须从后往前释放
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
@@ -91,22 +94,24 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1) # 新生成的token是block的第一个token时 需要新增block
 
     def may_append(self, seq: Sequence):
+        # 在序列生成新token时，更新该序列的block分配与缓存状态
         block_table = seq.block_table
-        last_block = self.blocks[block_table[-1]]
-        if len(seq) % self.block_size == 1:
+        last_block = self.blocks[block_table[-1]] 
+        # 当前正在写 或者已经写完的block
+        if len(seq) % self.block_size == 1: # 需要分配block了
             assert last_block.hash != -1
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
-        elif len(seq) % self.block_size == 0:
+        elif len(seq) % self.block_size == 0: # block写完了，计算block的hash
             assert last_block.hash == -1
             token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1 # 依赖前一个block计算hash
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
             self.hash_to_block_id[h] = last_block.block_id
-        else:
+        else: # 中部正在写
             assert last_block.hash == -1

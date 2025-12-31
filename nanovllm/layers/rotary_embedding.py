@@ -15,7 +15,7 @@ def apply_rotary_emb(
 
 
 class RotaryEmbedding(nn.Module):
-
+    # 旋转位置编码
     def __init__(
         self,
         head_size: int,
