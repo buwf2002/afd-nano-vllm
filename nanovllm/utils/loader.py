@@ -26,3 +26,33 @@ def load_model(model: nn.Module, path: str):
                     param = model.get_parameter(weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
+def load_model(model: nn.Module, path: str):
+    packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+
+    for file in glob(os.path.join(path, "*.safetensors")):
+        with safe_open(file, "pt", "cpu") as f: # 专门用来打开safetensors
+            for weight_name in f.keys():
+                for k in packed_modules_mapping:
+                    if k in weight_name:
+                        v, shard_id = packed_modules_mapping[k]
+                        param_name = weight_name.replace(k, v)
+                        try:
+                            param = model.get_parameter(param_name)
+                        except AttributeError:
+                            param = None
+                        if param is None:
+                            break 
+
+                        weight_loader = getattr(param, "weight_loader")
+                        weight_loader(param, f.get_tensor(weight_name), shard_id)
+                        break
+                else:
+                    try:
+                        param = model.get_parameter(weight_name)
+                    except AttributeError:
+                        param = None
+                    
+                    if param is None:
+                        continue
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, f.get_tensor(weight_name))

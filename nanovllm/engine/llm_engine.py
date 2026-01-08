@@ -5,12 +5,11 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
 
-from nanovllm.config import Config
+from nanovllm.config import Config, AFDConfig
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
-
+from nanovllm.engine.model_runner import ModelRunner, ModelFFNRunner
 
 class LLMEngine:
 
@@ -19,13 +18,17 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        config.afd_config = AFDConfig()
         # TP 主从进程的管理初始化，在多个进程创建ModelRunner
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
+            if config.afd_config.num_attention_servers > i:
+                process = ctx.Process(target=ModelRunner, args=(config, i, event), name=f"ModelRunner-T{i}")
+            else:
+                process = ctx.Process(target=ModelFFNRunner, args=(config, i, event), name=f"ModelFFNRunner-T{i}")
             process.start()
             self.ps.append(process)
             self.events.append(event)

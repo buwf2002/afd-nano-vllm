@@ -15,8 +15,9 @@ class VocabParallelEmbedding(nn.Module):
     ):
         
         super().__init__()
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        # TODO embeding不需要tp,暂时设置tp=1
+        self.tp_rank = 0
+        self.tp_size = 1
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size

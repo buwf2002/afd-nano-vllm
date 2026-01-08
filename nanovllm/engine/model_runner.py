@@ -1,4 +1,7 @@
+import atexit
+from ctypes import Union
 import pickle
+from typing import List
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -8,34 +11,47 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.misslayer import MissLayer
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-
+from nanovllm.engine.afd_transfer.afd_factory import AFDConnectorFactory
 
 class ModelRunner:
-
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
         hf_config = config.hf_config
+        self.afd_config = config.afd_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
 
+        # 初始化全局分布式环境
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        # 加载模型
-        self.model = Qwen3ForCausalLM(hf_config)
+
+        attn_ranks = list(range(self.afd_config.num_attention_servers))
+        self.attn_ranks_group = dist.new_group(ranks=attn_ranks)
+
+        # 初始化afd连接器
+        self.afd_connector = None
+        if self.afd_config is not None:
+            self.afd_connector = AFDConnectorFactory.create_connector(
+                self.rank, self.rank, self.afd_config
+            )
+
+        self.model = Qwen3ForCausalLM(hf_config, self.afd_connector)
+
         load_model(self.model, config.model)
         # 采样器，用于token生成时采样
         self.sampler = Sampler()
-        # 预热模型
+
         self.warmup_model()
-        # 分配显存
+        # 分配kv缓存
         self.allocate_kv_cache()
         if not self.enforce_eager:
             # 放在warmup之后是为了避免捕获init等一次性开销
@@ -44,7 +60,7 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
+        if self.afd_config.num_attention_servers > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
                 dist.barrier()
@@ -54,7 +70,7 @@ class ModelRunner:
                 self.loop()
 
     def exit(self):
-        if self.world_size > 1:
+        if self.afd_config.num_attention_servers > 1:
             self.shm.close()
             dist.barrier()
             if self.rank == 0:
@@ -62,6 +78,8 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
+        self.afd_connector.send_shutdown_signal()
+        dist.destroy_process_group(self.attn_ranks_group)
         dist.destroy_process_group()
 
     def loop(self):
@@ -72,7 +90,7 @@ class ModelRunner:
                 break
 
     def read_shm(self):
-        assert self.world_size > 1 and self.rank > 0
+        assert self.afd_config.num_attention_servers > 1 and self.rank > 0
         self.event.wait() # 等待set
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
@@ -81,7 +99,7 @@ class ModelRunner:
 
     def write_shm(self, method_name, *args):
         # 只使用GPU1 写入数据
-        assert self.world_size > 1 and self.rank == 0
+        assert self.afd_config.num_attention_servers > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
@@ -91,7 +109,7 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
+        if self.afd_config.num_attention_servers > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
@@ -115,7 +133,8 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"] # 已分配的显存总量
         # 每张卡负责的 kv 头数量
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        # num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        num_kv_heads = hf_config.num_key_value_heads
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         # 计算所有层所需的 kv cache 显存大小，单位字节
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
@@ -210,9 +229,17 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+        hidden_states = self.model(input_ids, positions)
+        logits = self.model.compute_logits(hidden_states)
+        return logits
+    
+        '''
+        TODO 使用cuda graph
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             # 如果batch size或者是prefill，直接进行模型计算
-            return self.model.compute_logits(self.model(input_ids, positions))
+            hidden_states = self.model(input_ids, positions)
+            logits = self.model.compute_logits(hidden_states)
+            return logits
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -229,6 +256,7 @@ class ModelRunner:
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
+        '''
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         # 进行kvcache的处理
@@ -289,3 +317,79 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+class ModelFFNRunner:
+    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+        self.config = config
+        hf_config = config.hf_config
+        self.afd_config = config.afd_config
+        self.block_size = config.kvcache_block_size
+        self.enforce_eager = config.enforce_eager
+        self.world_size = config.tensor_parallel_size
+        self.rank = rank
+        
+        self.shutdown_event = event
+
+        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        
+        torch.cuda.set_device(rank)
+        default_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_device("cuda")
+
+        ffn_ranks = list(range(self.afd_config.num_ffn_servers))
+        self.ffn_ranks_group = dist.new_group(ranks=ffn_ranks)
+
+        self.afd_connector = None
+        if self.afd_config is not None:
+            self.afd_connector = AFDConnectorFactory.create_connector(
+                self.rank, self.rank, self.afd_config
+            )
+
+        self.model = Qwen3ForCausalLM(hf_config, self.afd_connector)
+        load_model(self.model, config.model)
+        
+        # TODO: 恢复 cuda graph
+        
+        # 恢复 CPU 默认设置，防止后续无关操作误用 GPU
+        torch.set_default_device("cpu")
+        torch.set_default_dtype(default_dtype)
+
+        atexit.register(self.exit)
+
+        try:
+            self.ffn_loop()
+        except Exception as e:
+            print(f"[Rank {self.rank}] Fatal Error: {e}")
+            raise e
+        finally:
+            self.exit()
+
+    def ffn_loop(self):        
+        while True:
+            try:
+                self.execute_model()
+            except KeyboardInterrupt:
+                break
+            except StopIteration:
+                print(f"[Rank {self.rank}] Received shutdown signal.")
+                break
+            except Exception as e:
+                print(f"[Rank {self.rank}] Loop Error: {e}")
+        
+    def execute_model(self):
+        hidden_states, metadata = self.afd_connector.recv_attn_output()
+
+        if hidden_states is None and metadata.shutdown:
+            raise StopIteration
+        
+        layer_idx = metadata.layer_idx
+        ffn_output = self.model.model.layers[layer_idx].compute_mlp(hidden_states)
+        self.afd_connector.send_ffn_output(ffn_output, metadata)
+
+    def exit(self):
+        dist.destroy_process_group(self.ffn_ranks_group)
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        
+        

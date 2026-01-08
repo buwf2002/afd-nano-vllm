@@ -2,13 +2,15 @@ import torch
 from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3Config
-
+from nanovllm.config import AFDConfig
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.layers.misslayer import MissLayer
+from nanovllm.engine.afd_transfer.afd_connector import AFDConnectorBase, AFDConnectorMetadata
 
 
 class Qwen3Attention(nn.Module):
@@ -26,7 +28,8 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        # TODO Attention 不存在TP，直接修改为1
+        tp_size = 1
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -38,7 +41,7 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
-
+        
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -120,26 +123,36 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        afd_connector: AFDConnectorBase = None
     ) -> None:
         super().__init__()
-        self.self_attn = Qwen3Attention(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            max_position=config.max_position_embeddings,
-            rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', True),
-            head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
-        )
-        self.mlp = Qwen3MLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-        )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        if afd_connector.is_attn_server:
+            self.self_attn = Qwen3Attention(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                max_position=config.max_position_embeddings,
+                rms_norm_eps=config.rms_norm_eps,
+                qkv_bias=getattr(config, 'attention_bias', True),
+                head_dim=getattr(config, 'head_dim', None),
+                rope_theta=getattr(config, "rope_theta", 1000000),
+                rope_scaling=getattr(config, "rope_scaling", None),
+            )
+            self.mlp = MissLayer()
+            self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        elif afd_connector.is_ffn_server:
+            self.self_attn = MissLayer()
+            self.input_layernorm = MissLayer()
+            self.post_attention_layernorm = MissLayer()
+            self.mlp = Qwen3MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+            )
+        else:
+            raise ValueError("Invalid AFD role configuration.")
 
     def forward(
         self,
@@ -156,19 +169,54 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
+    def compute_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if residual is None:
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        return hidden_states, residual
+    
+    def compute_mlp(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states
+
 
 class Qwen3Model(nn.Module):
 
     def __init__(
         self,
         config: Qwen3Config,
+        afd_connector: AFDConnectorBase = None,
     ) -> None:
         super().__init__()
+        self.afd_connector = afd_connector
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size) # 151936, 1024
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(config, self.afd_connector) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.afd_connector is None:
+            return self._forward_standard(input_ids, positions)
+        elif self.afd_connector.is_attn_server:
+            return self._forward_afd_with_attn(input_ids, positions)
+        else:
+            raise ValueError("Invalid AFD role configuration.")
+
+    def _forward_standard(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
@@ -178,6 +226,48 @@ class Qwen3Model(nn.Module):
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
+    
+    def _forward_afd_with_attn(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor
+    ) -> torch.Tensor:
+        hidden_states = self.embed_tokens(input_ids)
+        residual = None
+
+        metadata = AFDConnectorMetadata()
+        for layer_idx, layer in enumerate(self.layers):
+            if layer_idx > 0:
+                ffn_output, _ = self.afd_connector.recv_ffn_output()
+                hidden_states.copy_(ffn_output)
+
+            current_hidden_states, residual = layer.compute_attention(positions, hidden_states, residual)
+
+            metadata.layer_idx = layer_idx
+            self.afd_connector.send_attn_output(current_hidden_states, metadata)
+            # print(f"[Rank {self.afd_connector.rank}] Attention Server: Layer {layer_idx} processed.")
+
+        # 最后一层接收回来
+        ffn_output, metadata = self.afd_connector.recv_ffn_output()
+        hidden_states.copy_(ffn_output)
+        assert metadata.layer_idx == len(self.layers) - 1, "Layer index mismatch."
+        # print(f"[Rank {self.afd_connector.rank}] Attention Server: Received last layer from FFN.")
+        hidden_states, _ = self.norm(hidden_states, residual)
+
+        return hidden_states
+    
+    def _forward_afd_with_ffn(
+        self
+    ) -> torch.Tensor:
+        hidden_states = None
+        for layer_idx, layer in enumerate(self.layers):
+            attn_output = self.afd_connector.recv_attn_output()
+            hidden_states.copy_(attn_output)
+
+            current_hidden_states = layer.compute_mlp(hidden_states)
+            self.afd_connector.send_ffn_output(current_hidden_states)
+        
         return hidden_states
 
 
@@ -192,10 +282,11 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config
+        config: Qwen3Config,
+        afd_connector: AFDConnectorBase = None
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
+        self.model = Qwen3Model(config, afd_connector)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
