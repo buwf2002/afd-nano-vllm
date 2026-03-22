@@ -1,9 +1,8 @@
-# Nano-vLLM
+# AFD-Nano-vLLM
 
 This repository serves as a learning resource for exploring **nano-vLLM**. It features support for Attention and Feed-Forward Network (FFN) disaggregation on the **Qwen3-0.6B** model.
 
 ### 📚 References & Documentation
-* [AFD Design Doc](https://docs.google.com/document/d/1GS2g8df7sdPmDvysmsURXN7xDDwnJfM6ERkBryUiTEA/edit?usp=sharing) *(Reference Material)*
 * [afd-nano-vLLM Design Document](https://my.feishu.cn/docx/D5oPdBjS4oCOUbxQHDsc79sBnkg?from=from_copylink) *(Detailed analysis and architecture for this repository)*
 
 ---
